@@ -1,0 +1,95 @@
+#Login 
+oc login --server=https://api.ocp.openshift.cool:6443
+
+# Export Variables
+
+DEV_PROJECT=dev-demo
+STAGE_PROJECT=stage-demo
+CICD_PROJECT=cicd-demo
+GOGS_USER=gogs
+GOGS_PWD=gogs
+
+#Creating the projects
+
+oc new-project ${DEV_PROJECT} '--display-name=Tasks - Dev'
+oc new-project ${STAGE_PROJECT} '--display-name=Tasks - Stage'
+oc new-project ${CICD_PROJECT} --display-name=CI/CD
+
+oc projects
+
+#Binding edit role to the service accounts
+oc policy add-role-to-group edit system:serviceaccounts:${CICD_PROJECT} -n ${DEV_PROJECT}
+oc policy add-role-to-group edit system:serviceaccounts:${CICD_PROJECT} -n ${STAGE_PROJECT}
+
+
+#Deploying Jenkins 
+
+oc new-app jenkins-ephemeral -n ${CICD_PROJECT}
+oc set resources dc/jenkins --limits=cpu=2,memory=2Gi --requests=cpu=100m,memory=512Mi 
+oc label dc jenkins app=jenkins --overwrite
+oc label dc jenkins "app.kubernetes.io/part-of"="jenkins" --overwrite
+oc rollout status dc jenkins
+
+
+#Deploying CICD Sample 
+
+oc new-app -f cicd-template.yaml -p DEV_PROJECT=${DEV_PROJECT} -p STAGE_PROJECT=${STAGE_PROJECT} -p EPHEMERAL=true -p ENABLE_QUAY=false -p QUAY_USERNAME= -p QUAY_PASSWORD= -n ${CICD_PROJECT}
+
+# Import wildfly Image to ImageStream
+oc import-image wildfly --from=openshift/wildfly-120-centos7 --confirm -n ${DEV_PROJECT}
+
+#Check the UPDATED status
+oc get is/wildfly -n ${DEV_PROJECT}
+
+
+#Creating the builds and deploymentconfigs 
+
+oc new-build --name=tasks --image-stream=wildfly:latest --binary=true -n ${DEV_PROJECT}
+oc new-app tasks:latest --allow-missing-images -n ${DEV_PROJECT}
+oc set triggers dc -l app=tasks --containers=tasks --from-image=tasks:latest --manual -n ${DEV_PROJECT}
+oc new-app tasks:stage --allow-missing-images -n ${STAGE_PROJECT}
+oc set triggers dc -l app=tasks --containers=tasks --from-image=tasks:stage --manual -n ${STAGE_PROJECT}
+oc expose dc/tasks --port=8080 -n ${DEV_PROJECT}
+oc expose svc/tasks -n ${DEV_PROJECT}
+oc set probe dc/tasks --readiness --get-url=http://:8080/ws/demo/healthcheck --initial-delay-seconds=30 --failure-threshold=10 --period-seconds=10 -n ${DEV_PROJECT}
+oc set probe dc/tasks --liveness --get-url=http://:8080/ws/demo/healthcheck --initial-delay-seconds=180 --failure-threshold=10 --period-seconds=10 -n ${DEV_PROJECT}
+oc rollout cancel dc/tasks -n ${STAGE_PROJECT}
+oc expose dc/tasks --port=8080 -n ${STAGE_PROJECT}
+oc expose svc/tasks -n ${STAGE_PROJECT}
+oc set probe dc/tasks --readiness --get-url=http://:8080/ws/demo/healthcheck --initial-delay-seconds=30 --failure-threshold=10 --period-seconds=10 -n ${STAGE_PROJECT}
+oc set probe dc/tasks --liveness --get-url=http://:8080/ws/demo/healthcheck --initial-delay-seconds=180 --failure-threshold=10 --period-seconds=10 -n ${STAGE_PROJECT}
+oc rollout cancel dc/tasks -n ${DEV_PROJECT}
+
+
+#Deploying GOGS
+GOGS_DOMAIN=$(oc get route jenkins -o template --template='{{.spec.host}}' | sed "s/jenkins-${CICD_PROJECT}.//g")
+oc new-app -f gogs-template-ephemeral.yaml --param=GOGS_VERSION=0.11.34 --param=DATABASE_VERSION=9.6 --param=HOSTNAME=gogs-$CICD_PROJECT.$GOGS_DOMAIN --param=SKIP_TLS_VERIFY=true
+oc label dc gogs "app.kubernetes.io/part-of"="gogs" --overwrite
+oc label dc gogs-postgresql "app.kubernetes.io/part-of"="gogs" --overwrite
+oc rollout status dc gogs
+
+#Configuring GOGS - Creating gogs user - mirroring openshift-sample and create webhooks
+sh gogs-setup.sh
+
+#SONARQUBE
+
+oc new-app -f sonarqube-template.yml --param=SONARQUBE_MEMORY_LIMIT=2Gi
+oc set resources dc/sonardb --limits=cpu=200m,memory=512Mi --requests=cpu=50m,memory=128Mi
+oc set resources dc/sonarqube --limits=cpu=1,memory=2Gi --requests=cpu=50m,memory=128Mi
+oc label dc sonarqube "app.kubernetes.io/part-of"="sonarqube" --overwrite
+oc label dc sonardb "app.kubernetes.io/part-of"="sonarqube" --overwrite
+oc rollout status dc sonarqube
+
+#NEXUS
+oc new-app -f nexus3-template.yaml --param=NEXUS_VERSION=3.13.0 --param=MAX_MEMORY=2Gi
+oc set resources dc/nexus --requests=cpu=200m --limits=cpu=2
+oc label dc nexus "app.kubernetes.io/part-of"="nexus" --overwrite
+oc rollout status dc nexus
+
+source nexus-functions
+
+NEXUS_DOMAIN=$(oc get route nexus -o template --template='{{.spec.host}}')
+
+add_nexus3_redhat_repos admin admin123 http://$NEXUS_DOMAIN
+
+Check if the repositories are configured correctly. 
