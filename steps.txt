@@ -1,6 +1,9 @@
 #Login 
 oc login --server=https://api.ocp.openshift.cool:6443
 
+git clone https://github.com/ralvares/cicd-steps
+cd cicd-steps
+
 # Export Variables
 
 DEV_PROJECT=dev-demo
